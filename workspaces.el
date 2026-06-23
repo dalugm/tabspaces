@@ -2,7 +2,7 @@
 
 ;; Author: Colin McLear <mclear@fastmail.com>
 ;; Maintainer: Mou Tong <mou.tong@qq.com>
-;; Version: 1.0.1
+;; Version: 1.0.3
 ;; Package-Requires: ((emacs "27.1") (compat "30") (project "0.8.1"))
 ;; URL: https://github.com/dalugm/workspaces
 ;; Keywords: convenience, frames
@@ -47,7 +47,7 @@
 
 ;;;; Requirements
 
-(eval-when-compile (require 'cl-lib))
+(require 'cl-lib)
 (require 'compat)
 (require 'tab-bar)
 (require 'project)
@@ -56,6 +56,12 @@
 
 (declare-function magit-init "magit-status")
 (declare-function magit-status-setup-buffer "magit-status")
+(declare-function tab-bar--current-tab "tab-bar")
+(declare-function tab-bar--tab-index-by-name "tab-bar")
+(declare-function project--ensure-read-project-list "project")
+(declare-function project--file-completion-table "project")
+(declare-function project--find-in-directory "project")
+(defvar project--list)
 
 ;;;; Variables
 
@@ -177,8 +183,7 @@ a bare repository."
 (defun workspaces--kill-buffer (&optional buffer)
   "Bury and remove BUFFER from current workspace.
 If BUFFER is nil, remove current buffer."
-  (let ((buffer (get-buffer (or buffer (current-buffer))))
-        (buffer-list (frame-parameter nil 'buffer-list)))
+  (let ((buffer (get-buffer (or buffer (current-buffer)))))
     (cond
      ((eq buffer (window-buffer (selected-window)))
       (if (one-window-p t)
@@ -193,7 +198,10 @@ If BUFFER is nil, remove current buffer."
       (message (format "Buffer `%s' removed from `%s' workspace."
                        buffer (workspaces--current-name)))))
     (bury-buffer buffer)
-    (delete buffer buffer-list)))
+    (let ((buf-list (frame-parameter nil 'buffer-list))
+          (buried-list (frame-parameter nil 'buried-buffer-list)))
+      (set-frame-parameter nil 'buffer-list (delete buffer buf-list))
+      (set-frame-parameter nil 'buried-buffer-list (delete buffer buried-list)))))
 
 (defun workspaces-kill-buffer (buffer)
   "Remove selected BUFFER from frame's buffer list."
@@ -205,7 +213,7 @@ If BUFFER is nil, remove current buffer."
       (read-buffer (format "Remove buffer from `%s' workspace: "
                            (workspaces--current-name))
                    nil t
-                   (lambda (b) (member (car b) blst))))))
+                   (lambda (b) (member (if (stringp b) b (car b)) blst))))))
   ;; Remove buffer from current workspace's buffer list.
   (workspaces--kill-buffer buffer))
 
@@ -222,13 +230,15 @@ The arguments NORECORD and FORCE-SAME-WINDOW are passed to `switch-to-buffer'."
   (switch-to-buffer buffer norecord force-same-window))
 
 ;; See https://emacs.stackexchange.com/a/53016/11934
-(defun workspaces--report-dupes (xs)
-  (let ((ys  ()))
-    (while xs
-      (unless (member (car xs) ys) ; Don't check it if already known to be a dup.
-        (when (member (car xs) (cdr xs)) (push (car xs) ys)))
-      (setq xs  (cdr xs)))
-    ys))
+(defun workspaces--report-dupes (list)
+  "Return a list of elements that appear more than once in LIST."
+  (let ((dupes ()))
+    (while list
+      (unless (member (car list) dupes)
+        (when (member (car list) (cdr list))
+          (push (car list) dupes)))
+      (setq list (cdr list)))
+    dupes))
 
 (defun workspaces-switch-buffer-and-tab (buffer &optional norecord force-same-window)
   "Switch to the tab of chosen buffer, or create buffer.
@@ -242,30 +252,31 @@ tab."
        "Switch to tab for buffer: " blst nil
        (lambda (b) (member (if (stringp b) b (car b)) blst))))))
 
-  ;; Action on buffer
-  (let* ((tabcand nil)
-         (buflst nil)
-         ;; Provide flat list of all buffers in all tabs (and print dupe buffers).
-         ;; This is the list of all buffers to search through.
-         (bufflst (flatten-tree (dolist (tab (workspaces--list) buflst)
-                                  (push (mapcar #'buffer-name (workspaces--buffer-list nil (tab-bar--tab-index-by-name tab)))
-                                        buflst))))
-         (dupe (member buffer (workspaces--report-dupes bufflst))))
-    ;; Run through conditions:
+  ;; Precompute a list of (tab-name . buffer-names) once, avoiding
+  ;; repeated O(N) tab lookups inside the conditions below.
+  (let* ((tab-buffers
+          (mapcar (lambda (tab)
+                    (cons tab
+                          (mapcar #'buffer-name
+                                  (workspaces--buffer-list
+                                   nil (tab-bar--tab-index-by-name tab)))))
+                  (workspaces--list)))
+         (all-buffers (mapcan #'cdr tab-buffers))
+         (dupe (member buffer (workspaces--report-dupes all-buffers)))
+         (buffer-tabs
+          (delq nil
+                (mapcar (lambda (cell)
+                          (and (member buffer (cdr cell)) (car cell)))
+                        tab-buffers))))
     (cond
      ;; 1. Buffer exists and is not open in more than one workspace.
-     ((and (get-buffer buffer)
-           (not dupe))
-      (dolist (tab (workspaces--list))
-        (when (member buffer (mapcar #'buffer-name (workspaces--buffer-list nil (tab-bar--tab-index-by-name tab))))
-          (progn (tab-bar-switch-to-tab tab)
-                 (workspaces-switch-to-buffer buffer)))))
+     ((and (get-buffer buffer) (not dupe))
+      (when buffer-tabs
+        (tab-bar-switch-to-tab (car buffer-tabs))
+        (workspaces-switch-to-buffer buffer)))
      ;; 2. Buffer exists and is open in more than one workspace.
      ((and (get-buffer buffer) dupe)
-      (dolist (tab (workspaces--list) tabcand)
-        (when (member buffer (mapcar #'buffer-name (workspaces--buffer-list nil (tab-bar--tab-index-by-name tab))))
-          (push tab tabcand)))
-      (tab-bar-switch-to-tab (completing-read "Select tab: " tabcand))
+      (tab-bar-switch-to-tab (completing-read "Select tab: " buffer-tabs))
       (workspaces-switch-to-buffer buffer))
      ;; 3. Buffer does not exist.
      ((yes-or-no-p "Buffer not found -- create a new workspace with buffer?")
@@ -291,10 +302,9 @@ If FRAME is nil, use the current frame."
 (defun workspaces-switch (&optional workspace)
   "Switch to tab if it exists, otherwise create a new tabbed workspace."
   (interactive
-   (if-let* ((tabs (workspaces--list)))
-       (list (completing-read "Select or create workspace: " tabs))
-     (tab-new)
-     (tab-rename (completing-read "Workspace name: " tabs))))
+   (list (if-let* ((tabs (workspaces--list)))
+             (completing-read "Select or create workspace: " tabs)
+           (completing-read "Workspace name: " nil))))
   (if (member workspace (workspaces--list))
       (tab-bar-switch-to-tab workspace)
     (tab-new)
@@ -391,18 +401,22 @@ With universal argument PREFIX, always create a new workspace."
       (delete-other-windows)
       ;; Git initialized if not version controlled.
       (let ((default-directory project-dir))
-        (if (workspaces--git-repo-p project-dir)
-            (if (fboundp 'magit-status-setup-buffer)
-                (magit-status-setup-buffer project-dir)
-              ;; Keep one vc buffer window and one workspace buffer window.
-              (split-window)
-              (project-vc-dir))
-          (if (fboundp 'magit-init)
-              (magit-init project-dir)
-            (vc-call-backend 'Git 'create-repo)
-            ;; Keep one vc buffer window and one workspace buffer window.
-            (split-window)
-            (project-vc-dir))))
+        (condition-case err
+            (if (workspaces--git-repo-p project-dir)
+                (if (fboundp 'magit-status-setup-buffer)
+                    (magit-status-setup-buffer project-dir)
+                  ;; Keep one vc buffer window and one workspace buffer window.
+                  (split-window)
+                  (project-vc-dir))
+              (if (fboundp 'magit-init)
+                  (magit-init project-dir)
+                (vc-call-backend 'Git 'create-repo)
+                ;; Keep one vc buffer window and one workspace buffer window.
+                (split-window)
+                (project-vc-dir)))
+          (error
+           (message "Failed to initialize version control in %s: %s"
+                    project-dir (error-message-string err)))))
       ;; Switch to workspace buffer window.
       (other-window 1)
       (project-switch-project project-dir)
@@ -470,9 +484,9 @@ The keymap should be installed globally under a prefix."
   (if workspaces-mode
       (progn
         (dolist (frame (frame-list))
-          (workspaces--set-buffer-predicate frame)
-          (add-hook 'after-make-frame-functions #'workspaces--set-buffer-predicate)
-          (add-to-list 'tab-bar-tab-post-open-functions #'workspaces--tab-post-open-function)))
+          (workspaces--set-buffer-predicate frame))
+        (add-hook 'after-make-frame-functions #'workspaces--set-buffer-predicate)
+        (add-to-list 'tab-bar-tab-post-open-functions #'workspaces--tab-post-open-function))
     (progn
       (dolist (frame (frame-list))
         (workspaces--reset-buffer-predicate frame))
