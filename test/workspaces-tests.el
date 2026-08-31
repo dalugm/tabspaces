@@ -1,6 +1,7 @@
 ;;; workspaces-tests.el --- Tests for workspaces -*- lexical-binding: t; -*-
 
 (require 'ert)
+(require 'cl-lib)
 (require 'workspaces)
 
 (ert-deftest workspaces-local-buffer-exclusion-takes-precedence ()
@@ -10,17 +11,16 @@
           (workspaces-exclude-buffers (list (buffer-name))))
       (should-not (workspaces--local-buffer-p (current-buffer))))))
 
-(ert-deftest workspaces-buffer-list-restores-from-public-window-state ()
+(ert-deftest workspaces-buffers-for-tab-restores-from-public-window-state ()
   (with-temp-buffer
     (rename-buffer "workspaces-state-buffer" t)
     (let ((buffer (current-buffer))
           (state (save-window-excursion
                    (switch-to-buffer (current-buffer))
                    (window-state-get))))
-      (cl-letf (((symbol-function 'workspaces--tabs)
-                 (lambda (&optional _frame)
-                   `((tab (name . "hidden") (ws . ,state))))))
-        (should (memq buffer (workspaces--buffer-list nil 0)))))))
+      (should (memq buffer
+                    (workspaces--buffers-for-tab
+                     `(tab (name . "hidden") (ws . ,state))))))))
 
 (ert-deftest workspaces-switch-buffer-does-not-mutate-tab-lists ()
   (let ((first (get-buffer-create "workspaces-first"))
@@ -29,14 +29,9 @@
         switched-buffer
         prompted)
     (unwind-protect
-        (cl-letf (((symbol-function 'workspaces--list)
-                   (lambda () '("one" "two")))
-                  ((symbol-function 'workspaces--tab-index-by-name)
-                   (lambda (name &optional _frame)
-                     (if (equal name "one") 0 1)))
-                  ((symbol-function 'workspaces--buffer-list)
-                   (lambda (&optional _frame index)
-                     (if (= index 0) (list first) (list second))))
+        (cl-letf (((symbol-function 'workspaces--tab-buffer-alist)
+                   (lambda (&optional _frame)
+                     `(("one" . (,first)) ("two" . (,second)))))
                   ((symbol-function 'tab-bar-switch-to-tab)
                    (lambda (name) (setq switched-tab name)))
                   ((symbol-function 'workspaces-switch-to-buffer)
@@ -56,16 +51,22 @@
   (let ((buffer (get-buffer-create "workspaces-unassigned"))
         switched)
     (unwind-protect
-        (cl-letf (((symbol-function 'workspaces--list) (lambda () '("one")))
-                  ((symbol-function 'workspaces--tab-index-by-name)
-                   (lambda (&rest _args) 0))
-                  ((symbol-function 'workspaces--buffer-list)
-                   (lambda (&rest _args) nil))
+        (cl-letf (((symbol-function 'workspaces--tab-buffer-alist)
+                   (lambda (&optional _frame) '(("one"))))
                   ((symbol-function 'workspaces-switch-to-buffer)
                    (lambda (name &rest _args) (setq switched name))))
           (workspaces-switch-buffer-and-tab (buffer-name buffer))
           (should (equal switched (buffer-name buffer))))
       (kill-buffer buffer))))
+
+(ert-deftest workspaces-creates-missing-buffer-in-current-tab ()
+  (let ((name "workspaces-new-buffer")
+        switched)
+    (cl-letf (((symbol-function 'yes-or-no-p) (lambda (&rest _args) nil))
+              ((symbol-function 'switch-to-buffer)
+               (lambda (buffer &rest _args) (setq switched buffer))))
+      (workspaces-switch-buffer-and-tab name)
+      (should (equal switched name)))))
 
 (ert-deftest workspaces-restores-existing-frame-buffer-predicate ()
   (let* ((frame (selected-frame))
@@ -99,14 +100,10 @@
         (unique (get-buffer-create "workspaces-unique"))
         closed)
     (unwind-protect
-        (cl-letf (((symbol-function 'workspaces--list)
-                   (lambda () '("target" "other")))
-                  ((symbol-function 'workspaces--tab-index-by-name)
-                   (lambda (name &optional _frame)
-                     (if (equal name "target") 0 1)))
-                  ((symbol-function 'workspaces--buffer-list)
-                   (lambda (&optional _frame index)
-                     (if (= index 0) (list shared unique) (list shared))))
+        (cl-letf (((symbol-function 'workspaces--tab-buffer-alist)
+                   (lambda (&optional _frame)
+                     `(("target" . (,shared ,unique))
+                       ("other" . (,shared)))))
                   ((symbol-function 'tab-bar-close-tab-by-name)
                    (lambda (name) (setq closed name))))
           (workspaces-close "target")

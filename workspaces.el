@@ -3,12 +3,12 @@
 ;; Author: Colin McLear <mclear@fastmail.com>
 ;; Maintainer: Mou Tong <mou.tong@qq.com>
 ;; Version: 1.1.0
-;; Package-Requires: ((emacs "29.1") (project "0.8.1"))
+;; Package-Requires: ((emacs "30.1"))
 ;; URL: https://github.com/dalugm/workspaces
 ;; Keywords: convenience, frames
 
 ;; Copyright (c) 2022-2023 Colin McLear
-;; Copyright (c) 2024 Mou Tong
+;; Copyright (c) 2024-2026 Mou Tong
 
 ;; This file is not part of GNU Emacs
 
@@ -30,9 +30,7 @@
 ;; This package provides several functions to facilitate a frame-based
 ;; tab workflow with one workspace per tab, integration with `project'
 ;; (for project-based workspaces) and buffer isolation per tab (i.e. a
-;; "workspace").  The package assumes `project' and `tab-bar' are both
-;; present (they are built-in to Emacs 27.1+, while this package
-;; requires Emacs 29.1 for its keymap API).
+;; "workspace").
 
 ;;; Acknowledgements
 ;; Much of the package code is inspired by:
@@ -48,9 +46,9 @@
 
 ;;;; Requirements
 
-(require 'cl-lib)
 (require 'tab-bar)
 (require 'project)
+(require 'subr-x)
 (require 'vc)
 (require 'seq)
 
@@ -65,20 +63,20 @@
 
 (defcustom workspaces-include-buffers '("*scratch*" "*Messages*")
   "Buffers that should always get included in a new workspace.
-This is a string list that matches buffer names, which does not
-overrides buffers excluded by `workspaces-exclude-buffers'."
+This is a list of buffer names.  `workspaces-exclude-buffers'
+takes precedence over this option."
   :group 'workspaces
   :type '(repeat string))
 
 (defcustom workspaces-exclude-buffers nil
   "Buffers that should always get excluded in a new workspace.
-This is a string list that matches buffer names, which overrides
-buffers inside `workspaces-include-buffers'."
+This is a list of buffer names.  It takes precedence over
+`workspaces-include-buffers'."
   :group 'workspaces
   :type '(repeat string))
 
 (defcustom workspaces-project-switch-commands project-switch-commands
-  "Available commands when switch between projects.
+  "Available commands when switching between projects.
 Change this value if you wish to run a specific command, such as
 `find-file' on project switch.  Otherwise this will default to
 the value of `project-switch-commands'."
@@ -96,24 +94,25 @@ the value of `project-switch-commands'."
   (make-hash-table :weakness 'key)
   "Saved and installed buffer predicates, keyed by frame.")
 
+(defun workspaces--included-buffer-p (buffer)
+  "Return non-nil when BUFFER is explicitly shared with every workspace."
+  (let ((name (buffer-name buffer)))
+    (and name
+         (member name workspaces-include-buffers)
+         (not (member name workspaces-exclude-buffers)))))
+
 (defun workspaces--reset-buffer-list ()
   "Reset the current TAB's `buffer-list'.
-Only the buffers in `workspaces-include-buffers' and buffers not
-in `workspaces-exclude-buffers' are kept in the `buffer-list' and
-`buried-buffer-list'."
+Only explicitly included, non-excluded buffers are retained in
+`buffer-list' and `buried-buffer-list'."
   ;; https://www.gnu.org/software/emacs/manual/html_node/elisp/Current-Buffer.html
   ;; The current-tab uses `buffer-list' and `buried-buffer-list'.
   ;; A hidden tab keeps these as `wc-bl' and `wc-bbl'.
-  (cl-flet* ((filter-fn (buffer)
-               (and (member (buffer-name buffer) workspaces-include-buffers)
-                    (not (member (buffer-name buffer) workspaces-exclude-buffers))))
-             (update-frame (param)
-               (set-frame-parameter
-                nil
-                param
-                (seq-filter #'filter-fn (frame-parameter nil param)))))
-    (update-frame 'buffer-list)
-    (update-frame 'buried-buffer-list)))
+  (dolist (parameter '(buffer-list buried-buffer-list))
+    (set-frame-parameter
+     nil parameter
+     (seq-filter #'workspaces--included-buffer-p
+                 (frame-parameter nil parameter)))))
 
 (defun workspaces--tab-post-open-function (_tab)
   "Update buffer list on new tab creation."
@@ -152,51 +151,42 @@ in `workspaces-exclude-buffers' are kept in the `buffer-list' and
     (remhash frame workspaces--frame-buffer-predicates)))
 
 (defun workspaces--tabs (&optional frame)
-  "Return FRAME's tabs through `tab-bar-tabs-function'."
-  (funcall tab-bar-tabs-function frame))
+  "Return FRAME's canonical list of tabs."
+  (tab-bar-tabs frame))
 
-(defun workspaces--tab-index-by-name (name &optional frame)
-  "Return the index of the tab named NAME on FRAME."
-  (seq-position (workspaces--tabs frame)
-                name
-                (lambda (tab tab-name)
-                  (equal (alist-get 'name tab) tab-name))))
-
-(defun workspaces--buffer-list (&optional frame index)
-  "Return a list of live buffers associated with FRAME and INDEX.
-A non-nil FRAME will select the specific frame instead of the current
-one.  A non-nil INDEX will specify the corresponding tab index in the
-given frame."
+(defun workspaces--buffers-for-tab (tab &optional frame)
+  "Return live buffers belonging to TAB on FRAME."
   (seq-filter #'buffer-live-p
-              (if index
-                  (let ((tab (nth index (workspaces--tabs frame))))
-                    (if (eq 'current-tab (car tab))
-                        (frame-parameter frame 'buffer-list)
-                      (or (alist-get 'wc-bl tab)
-                          (mapcar (lambda (buffer)
-                                    (if (bufferp buffer)
-                                        buffer
-                                      (get-buffer buffer)))
-                                  (window-state-buffers
-                                   (alist-get 'ws tab))))))
-                (frame-parameter frame 'buffer-list))))
+              (if (eq 'current-tab (car tab))
+                  (frame-parameter frame 'buffer-list)
+                (or (alist-get 'wc-bl tab)
+                    (mapcar (lambda (buffer)
+                              (if (bufferp buffer)
+                                  buffer
+                                (get-buffer buffer)))
+                            (window-state-buffers (alist-get 'ws tab)))))))
+
+(defun workspaces--buffer-list (&optional frame)
+  "Return live buffers associated with FRAME's current workspace."
+  (seq-filter #'buffer-live-p
+              (frame-parameter frame 'buffer-list)))
+
+(defun workspaces--tab-buffer-alist (&optional frame)
+  "Return an alist mapping each workspace on FRAME to its live buffers."
+  (mapcar (lambda (tab)
+            (cons (alist-get 'name tab)
+                  (workspaces--buffers-for-tab tab frame)))
+          (workspaces--tabs frame)))
 
 ;;;; Project Workspace Helper Functions
 
-(defun workspaces--git-repo-p (directory &optional non-bare)
-  "Return t if DIRECTORY is a Git repository.
-When optional NON-BARE is non-nil also return nil if DIRECTORY is
-a bare repository."
-  (and (file-directory-p directory) ; Avoid archives, see #3397.
-       (or (file-regular-p (expand-file-name ".git" directory))
-           (file-directory-p (expand-file-name ".git" directory))
-           (and (not non-bare)
-                (file-regular-p (expand-file-name "HEAD" directory))
-                (file-directory-p (expand-file-name "refs" directory))
-                (file-directory-p (expand-file-name "objects" directory))))))
+(defun workspaces--vc-backend (directory)
+  "Return the VC backend responsible for DIRECTORY, or nil."
+  (and (file-directory-p directory)
+       (vc-responsible-backend directory t)))
 
 (defun workspaces--current-name ()
-  "Get name of current workspace."
+  "Return the name of the current workspace."
   (alist-get 'name
              (seq-find (lambda (tab) (eq (car tab) 'current-tab))
                        (workspaces--tabs))))
@@ -253,22 +243,19 @@ This is the frame/tab-local equivalent to `switch-to-buffer'.
 The arguments NORECORD and FORCE-SAME-WINDOW are passed to `switch-to-buffer'."
   (interactive
    (list
-    (let ((blst (cl-remove (buffer-name) (mapcar #'buffer-name (workspaces--buffer-list)))))
+    (let ((blst (delete (buffer-name)
+                        (mapcar #'buffer-name (workspaces--buffer-list)))))
       (read-buffer
        "Switch to local buffer: " blst nil
        (lambda (b) (member (if (stringp b) b (car b)) blst))))))
   (switch-to-buffer buffer norecord force-same-window))
 
-;; See https://emacs.stackexchange.com/a/53016/11934
-(defun workspaces--report-dupes (list)
-  "Return a list of elements that appear more than once in LIST."
-  (let ((dupes ()))
-    (while list
-      (unless (member (car list) dupes)
-        (when (member (car list) (cdr list))
-          (push (car list) dupes)))
-      (setq list (cdr list)))
-    dupes))
+(defun workspaces--buffer-tabs (buffer &optional frame)
+  "Return names of workspaces on FRAME that contain BUFFER."
+  (when-let* ((buffer (and buffer (get-buffer buffer))))
+    (seq-keep (lambda (entry)
+                (and (memq buffer (cdr entry)) (car entry)))
+              (workspaces--tab-buffer-alist frame))))
 
 (defun workspaces-switch-buffer-and-tab (buffer &optional norecord force-same-window)
   "Switch to BUFFER and its workspace, or create BUFFER.
@@ -277,43 +264,29 @@ in the current workspace.  NORECORD and FORCE-SAME-WINDOW are
 passed to `switch-to-buffer'."
   (interactive
    (list
-    (let ((blst (cl-remove (buffer-name) (mapcar #'buffer-name (buffer-list)))))
+    (let ((blst (delete (buffer-name) (mapcar #'buffer-name (buffer-list)))))
       (read-buffer
        "Switch to tab for buffer: " blst nil
        (lambda (b) (member (if (stringp b) b (car b)) blst))))))
 
-  ;; Precompute a list of (tab-name . buffer-names) once, avoiding
-  ;; repeated O(N) tab lookups inside the conditions below.
-  (let* ((tab-buffers
-          (mapcar (lambda (tab)
-                    (cons tab
-                          (mapcar #'buffer-name
-                                  (workspaces--buffer-list
-                                   nil (workspaces--tab-index-by-name tab)))))
-                  (workspaces--list)))
-         (all-buffers (mapcan (lambda (cell)
-                                (copy-sequence (cdr cell)))
-                              tab-buffers))
-         (dupe (member buffer (workspaces--report-dupes all-buffers)))
-         (buffer-tabs
-          (delq nil
-                (mapcar (lambda (cell)
-                          (and (member buffer (cdr cell)) (car cell)))
-                        tab-buffers))))
+  (let* ((live-buffer (get-buffer buffer))
+         (buffer-tabs (workspaces--buffer-tabs live-buffer)))
     (cond
-     ;; 1. Buffer exists and is not open in more than one workspace.
-     ((and (get-buffer buffer) (not dupe))
-      (when buffer-tabs
-        (tab-bar-switch-to-tab (car buffer-tabs)))
+     ;; Buffer belongs to exactly one workspace.
+     ((and live-buffer (length= buffer-tabs 1))
+      (tab-bar-switch-to-tab (car buffer-tabs))
       (workspaces-switch-to-buffer buffer norecord force-same-window))
-     ;; 2. Buffer exists and is open in more than one workspace.
-     ((and (get-buffer buffer) dupe)
+     ;; Buffer is shared by multiple workspaces.
+     ((and live-buffer (length> buffer-tabs 1))
       (tab-bar-switch-to-tab (completing-read "Select tab: " buffer-tabs))
       (workspaces-switch-to-buffer buffer norecord force-same-window))
-     ;; 3. Buffer does not exist.
+     ;; Buffer exists but is not assigned to any workspace.
+     (live-buffer
+      (workspaces-switch-to-buffer buffer norecord force-same-window))
+     ;; Buffer does not exist.
      ((yes-or-no-p "Buffer not found -- create a new workspace with buffer?")
       (switch-to-buffer-other-tab buffer))
-     ;; 4. Default -- create buffer in current workspace.
+     ;; Create the buffer in the current workspace.
      (t
       (switch-to-buffer buffer norecord force-same-window)))))
 
@@ -353,40 +326,35 @@ If FRAME is nil, use the current frame."
 ;;;;; Close Workspace & Kill Buffers
 (defun workspaces-close (workspace)
   "Kill all buffers and close current WORKSPACE.
-When with a \\[universal-argument], select a WORKSPACE to close."
+With a \\[universal-argument], select a WORKSPACE to close."
   (interactive
    (list (if (equal current-prefix-arg '(4))
              (completing-read "Close workspace: " (workspaces--list))
            (workspaces--current-name))))
-  (if (= 1 (length (workspaces--list)))
-      (user-error "Attempt to close the sole workspace")
-    (let ((buf-lst (workspaces--buffer-list
-                    nil
-                    (workspaces--tab-index-by-name workspace))))
+  (let* ((tab-buffers (workspaces--tab-buffer-alist))
+         (target (assoc-string workspace tab-buffers)))
+    (unless target
+      (user-error "Unknown workspace: %s" workspace))
+    (when (length= tab-buffers 1)
+      (user-error "Attempt to close the sole workspace"))
+    (let ((other-buffers
+           (mapcan (lambda (entry)
+                     (unless (eq entry target)
+                       (copy-sequence (cdr entry))))
+                   tab-buffers)))
       (unwind-protect
-          (cl-loop for buf in buf-lst
-                   do (unless (or (and (member (buffer-name buf)
-                                               workspaces-include-buffers)
-                                      (not (member (buffer-name buf)
-                                                   workspaces-exclude-buffers)))
-                                  (seq-some
-                                   (lambda (other)
-                                     (and (not (equal other workspace))
-                                          (memq buf
-                                                (workspaces--buffer-list
-                                                 nil
-                                                 (workspaces--tab-index-by-name
-                                                  other)))))
-                                   (workspaces--list)))
-                        (kill-buffer buf)))
+          (dolist (buffer (cdr target))
+            (unless (or (workspaces--included-buffer-p buffer)
+                        (memq buffer other-buffers))
+              (kill-buffer buffer)))
         (tab-bar-close-tab-by-name workspace)))))
 
 ;;;;; Open project in workspace.
-(defun workspaces--generate-name (base-name existed-workspaces)
-  "Generate a unique tab name from BASE-NAME and EXISTED-WORKSPACES."
+(defun workspaces--generate-name (base-name existing-workspaces)
+  "Generate a unique tab name from BASE-NAME and EXISTING-WORKSPACES."
   (let ((counter 2)
         (new-name base-name))
-    (while (member new-name existed-workspaces)
+    (while (member new-name existing-workspaces)
       (setq new-name (format "%s<%d>" base-name counter)
             counter (1+ counter)))
     new-name))
@@ -408,16 +376,17 @@ DIR, DEFAULT, and MUSTMATCH are passed to `read-directory-name'."
 The project is chosen among projects known from the project list,
 see `project-list-file'.
 It's also possible to enter an arbitrary directory not in the list."
-  (let* ((dir-choice "... (choose a dir)")
+  (let* ((directory-choice "... (choose a dir)")
          (choices (append (project-known-project-roots)
-                          (list dir-choice)))
-         (pr-dir ""))
-    (while (equal pr-dir "")
+                          (list directory-choice)))
+         (project-directory ""))
+    (while (string-empty-p project-directory)
       ;; If the user simply pressed RET, do this again until they don't.
-      (setq pr-dir (completing-read "Select project: " choices nil t)))
-    (if (equal pr-dir dir-choice)
+      (setq project-directory
+            (completing-read "Select project: " choices nil t)))
+    (if (equal project-directory directory-choice)
         (workspaces--read-directory-name "Select directory: ")
-      pr-dir)))
+      project-directory)))
 
 (defun workspaces--normalize-directory (directory)
   "Return DIRECTORY in the canonical form used by workspaces."
@@ -434,64 +403,72 @@ With universal argument PREFIX, always create a new workspace."
   (interactive
    (list (workspaces--prompt-project-dir) current-prefix-arg))
   (let* ((project-switch-commands workspaces-project-switch-commands)
-         (project-dir (workspaces--normalize-directory project))
+         (project-directory (workspaces--normalize-directory project))
          (known-projects
           (mapcar #'workspaces--normalize-directory
                   (project-known-project-roots)))
-         (existed-workspaces (workspaces--list))
-         (ws-name (or (car (member project-dir existed-workspaces))
-                      (workspaces--generate-name project-dir existed-workspaces)))
-         (project-existed-p (member project-dir known-projects))
-         (create-ws-p (or prefix (not (member ws-name existed-workspaces)))))
+         (existing-workspaces (workspaces--list))
+         (workspace-name
+          (if (member project-directory existing-workspaces)
+              project-directory
+            (workspaces--generate-name project-directory
+                                       existing-workspaces)))
+         (known-project (member project-directory known-projects))
+         (create-workspace (or prefix
+                               (not (member workspace-name
+                                            existing-workspaces)))))
     (cond
      ;; If there is no workspace nor project, create both.
-     ((not project-existed-p)
+     ((not known-project)
       (tab-bar-new-tab)
-      (tab-bar-rename-tab ws-name)
+      (tab-bar-rename-tab workspace-name)
       (delete-other-windows)
       ;; Git initialized if not version controlled.
-      (let ((default-directory project-dir))
+      (let ((default-directory project-directory))
         (condition-case err
-            (if (workspaces--git-repo-p project-dir)
+            (if (workspaces--vc-backend project-directory)
                 (if (fboundp 'magit-status-setup-buffer)
-                    (magit-status-setup-buffer project-dir)
+                    (magit-status-setup-buffer project-directory)
                   ;; Keep one vc buffer window and one workspace buffer window.
                   (split-window)
                   (project-vc-dir))
               (if (fboundp 'magit-init)
-                  (magit-init project-dir)
-                (vc-call-backend 'Git 'create-repo)
+                  (magit-init project-directory)
+                (vc-create-repo 'Git)
                 ;; Keep one vc buffer window and one workspace buffer window.
                 (split-window)
                 (project-vc-dir)))
           (error
            (message "Failed to initialize version control in %s: %s"
-                    project-dir (error-message-string err)))))
+                    project-directory (error-message-string err)))))
       ;; Switch to workspace buffer window.
       (other-window 1)
-      (project-switch-project project-dir)
+      (project-switch-project project-directory)
       ;; Remember new project.
-      (when-let* ((pr (project-current nil project-dir)))
-        (project-remember-project pr)))
+      (when-let* ((project (project-current nil project-directory)))
+        (project-remember-project project)))
 
      ;; If project and workspace exists, but we want a new workspace.
-     ((and project-existed-p (member ws-name existed-workspaces) create-ws-p)
-      (let ((new-ws-name (workspaces--generate-name ws-name existed-workspaces)))
+     ((and known-project
+           (member workspace-name existing-workspaces)
+           create-workspace)
+      (let ((new-workspace-name
+             (workspaces--generate-name workspace-name existing-workspaces)))
         (tab-bar-new-tab)
-        (tab-bar-rename-tab new-ws-name)
-        (project-switch-project project-dir)))
+        (tab-bar-rename-tab new-workspace-name)
+        (project-switch-project project-directory)))
 
      ;; If project and workspace exists.
-     ((and project-existed-p (member ws-name existed-workspaces))
-      (tab-bar-switch-to-tab ws-name)
-      (project-switch-project project-dir))
+     ((and known-project (member workspace-name existing-workspaces))
+      (tab-bar-switch-to-tab workspace-name)
+      (project-switch-project project-directory))
 
      ;; If project exists, but no corresponding workspace, create a
      ;; new workspace.
-     (project-existed-p
+     (known-project
       (tab-bar-new-tab)
-      (tab-bar-rename-tab ws-name)
-      (project-switch-project project-dir))
+      (tab-bar-rename-tab workspace-name)
+      (project-switch-project project-directory))
 
      (t
       (message "No project found or created.")
@@ -536,13 +513,13 @@ The keymap should be installed globally under a prefix."
         (dolist (frame (frame-list))
           (workspaces--set-buffer-predicate frame))
         (add-hook 'after-make-frame-functions #'workspaces--set-buffer-predicate)
-        (add-to-list 'tab-bar-tab-post-open-functions #'workspaces--tab-post-open-function))
-    (progn
-      (dolist (frame (frame-list))
-        (workspaces--reset-buffer-predicate frame))
-      (setq tab-bar-tab-post-open-functions
-            (remove #'workspaces--tab-post-open-function tab-bar-tab-post-open-functions))
-      (remove-hook 'after-make-frame-functions #'workspaces--set-buffer-predicate))))
+        (add-hook 'tab-bar-tab-post-open-functions
+                  #'workspaces--tab-post-open-function))
+    (dolist (frame (frame-list))
+      (workspaces--reset-buffer-predicate frame))
+    (remove-hook 'tab-bar-tab-post-open-functions
+                 #'workspaces--tab-post-open-function)
+    (remove-hook 'after-make-frame-functions #'workspaces--set-buffer-predicate)))
 
 (provide 'workspaces)
 ;;; workspaces.el ends here

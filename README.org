@@ -1,6 +1,22 @@
 #+title: Workspaces
 #+author: Mou Tong
 
+* Model
+
+Each Emacs tab is a workspace.  Its window state and buffer lists are
+kept by =tab-bar=, while =workspaces-mode= filters buffer-selection
+commands to the current tab's buffers.  Buffer ownership is derived
+from =tab-bar='s canonical tab state, so switching and closing a
+workspace use the same source of truth.
+
+This is isolation inside one Emacs process.  Emacs-wide state such as
+the kill ring, registers, processes, and global histories remains
+shared.  Use separate Emacs processes when that state must also be
+isolated.
+
+Buffers named in =workspaces-include-buffers= are intentionally shared
+by all workspaces.  =workspaces-exclude-buffers= takes precedence.
+
 * Installation
 
 This is a modified version of the original [[https://github.com/mclear-tools/tabspaces][tabspaces]].
